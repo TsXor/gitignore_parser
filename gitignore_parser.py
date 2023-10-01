@@ -4,35 +4,62 @@ import re
 
 from os.path import dirname
 from pathlib import Path
-from typing import Reversible, Union
+from functools import partial
+from typing import Reversible, Union, Optional, Callable
 
-def handle_negation(file_path, rules: Reversible["IgnoreRule"]):
+def assert_absolute(path: Path):
+    if not path.is_absolute():
+        raise ValueError('path must be absolute')
+
+def str_lcut(s: str, match: str):
+    if s.startswith(match):
+        return s[len(match):], True
+    else:
+        return s, False
+
+def str_rcut(s: str, match: str):
+    if s.endswith(match):
+        return s[:-len(match)], True
+    else:
+        return s, False
+
+def handle_negation(rules: Reversible["IgnoreRule"], _file_path: Union[str, Path]):
+    if isinstance(_file_path, Path):
+        file_path = _file_path
+        is_dir = None
+    elif isinstance(_file_path, str):
+        file_path = Path(_file_path)
+        is_dir = _file_path[-1] == os.sep
+    else:
+        raise ValueError('path must be string or Path object')
+    
     for rule in reversed(rules):
-        if rule.match(file_path):
+        if rule.match(file_path, is_dir):
             return not rule.negation
     return False
 
-def parse_gitignore(full_path, base_dir=None):
-    if base_dir is None:
-        base_dir = dirname(full_path)
-    rules = []
+def parse_gitignore(
+    _full_path: Union[str, Path],
+    _base_dir: Optional[Union[str, Path]] = None
+) -> Callable[[Union[str, Path]], bool]:
+    full_path = Path(_full_path)
+    if _base_dir is None: base_dir = full_path.parent
+    else: base_dir = Path(_base_dir)
+    
+    rules: list[IgnoreRule] = []
     with open(full_path) as ignore_file:
-        counter = 0
-        for line in ignore_file:
-            counter += 1
+        for lineno, line in enumerate(ignore_file):
             line = line.rstrip('\n')
-            rule = rule_from_pattern(line, base_path=Path(base_dir).resolve(),
-                                     source=(full_path, counter))
-            if rule:
-                rules.append(rule)
-    if not any(r.negation for r in rules):
-        return lambda file_path: any(r.match(file_path) for r in rules)
-    else:
-        # We have negation rules. We can't use a simple "any" to evaluate them.
-        # Later rules override earlier rules.
-        return lambda file_path: handle_negation(file_path, rules)
+            rule = rule_from_pattern(
+                line,
+                base_path = base_dir.resolve(),
+                source = (full_path, lineno + 1)
+            )
+            if rule: rules.append(rule)
+    
+    return partial(handle_negation, rules)
 
-def rule_from_pattern(pattern, base_path=None, source=None):
+def rule_from_pattern(pattern: str, base_path: Path, source: tuple[Path, int]):
     """
     Take a .gitignore match pattern, such as "*.py[cod]" or "**/*.bak",
     and return an IgnoreRule suitable for matching against files and
@@ -41,23 +68,17 @@ def rule_from_pattern(pattern, base_path=None, source=None):
     Because git allows for nested .gitignore files, a base_path value
     is required for correct behavior. The base path should be absolute.
     """
-    if base_path and base_path != Path(base_path).resolve():
-        raise ValueError('base_path must be absolute')
+    assert_absolute(base_path)
     # Store the exact pattern for our repr and string functions
     orig_pattern = pattern
     # Early returns follow
     # Discard comments and separators
-    if pattern.strip() == '' or pattern[0] == '#':
-        return
+    if pattern.strip() == '' or pattern[0] == '#': return
     # Discard anything with more than two consecutive asterisks
-    if pattern.find('***') > -1:
-        return
+    if pattern.find('***') > -1: return
     # Strip leading bang before examining double asterisks
-    if pattern[0] == '!':
-        negation = True
-        pattern = pattern[1:]
-    else:
-        negation = False
+    negation = pattern[0] == '!'
+    if negation: pattern = pattern[1:]
     # Discard anything with invalid double-asterisks -- they can appear
     # at the start or the end, or be surrounded by slashes
     for m in re.finditer(r'\*\*', pattern):
@@ -68,37 +89,22 @@ def rule_from_pattern(pattern, base_path=None, source=None):
             return
 
     # Special-casing '/', which doesn't match any files or directories
-    if pattern.rstrip() == '/':
-        return
+    if pattern.rstrip() == '/': return
 
     directory_only = pattern[-1] == '/'
-    # A slash is a sign that we're tied to the base_path of our rule
-    # set.
+    # A slash is a sign that we're tied to the base_path of our rule set.
     anchored = '/' in pattern[:-1]
-    if pattern[0] == '/':
-        pattern = pattern[1:]
-    if pattern[0] == '*' and len(pattern) >= 2 and pattern[1] == '*':
-        pattern = pattern[2:]
-        anchored = False
-    if pattern[0] == '/':
-        pattern = pattern[1:]
-    if pattern[-1] == '/':
-        pattern = pattern[:-1]
+    pattern, _ = str_lcut(pattern, '/')
+    pattern, have_double_asterisk = str_lcut(pattern, '**')
+    if have_double_asterisk: anchored = False
+    pattern, _ = str_lcut(pattern, '/')
+    pattern, _ = str_rcut(pattern, '/')
     # patterns with leading hashes are escaped with a backslash in front, unescape it
-    if pattern[0] == '\\' and pattern[1] == '#':
-        pattern = pattern[1:]
+    if pattern.startswith('\\#'): pattern = pattern[1:]
     # trailing spaces are ignored unless they are escaped with a backslash
-    i = len(pattern)-1
-    striptrailingspaces = True
-    while i > 1 and pattern[i] == ' ':
-        if pattern[i-1] == '\\':
-            pattern = pattern[:i-1] + pattern[i:]
-            i = i - 1
-            striptrailingspaces = False
-        else:
-            if striptrailingspaces:
-                pattern = pattern[:i]
-        i = i - 1
+    pattern = pattern.rstrip()
+    pattern, have_escaped_space = str_rcut(pattern, '\\')
+    if have_escaped_space: pattern += ' '
     regex = fnmatch_pathname_to_regex(
         pattern, directory_only, negation, anchored=bool(anchored)
     )
@@ -108,10 +114,11 @@ def rule_from_pattern(pattern, base_path=None, source=None):
         negation=negation,
         directory_only=directory_only,
         anchored=anchored,
-        base_path=Path(base_path) if base_path else None,
+        base_path=base_path,
         source=source
     )
 
+whitespace_re = re.compile(r'(\\ )+$')
 
 IGNORE_RULE_FIELDS = [
     'pattern', 'regex',  # Basic values
@@ -122,27 +129,30 @@ IGNORE_RULE_FIELDS = [
 
 
 class IgnoreRule(collections.namedtuple('IgnoreRule_', IGNORE_RULE_FIELDS)):
+    pattern: str
+    regex: str
+    negation: bool
+    directory_only: bool
+    anchored: bool
+    base_path: Path
+    source: tuple[Path, int]
+    
     def __str__(self):
         return self.pattern
 
     def __repr__(self):
-        return ''.join(['IgnoreRule(\'', self.pattern, '\')'])
+        return 'IgnoreRule(\'%s\')' % self.pattern
 
-    def match(self, abs_path: Union[str, Path]):
-        matched = False
-        if self.base_path:
-            rel_path = str(Path(abs_path).resolve().relative_to(self.base_path))
-        else:
-            rel_path = str(Path(abs_path))
-        # Path() strips the trailing slash, so we need to preserve it
-        # in case of directory-only negation
-        if self.negation and type(abs_path) == str and abs_path[-1] == '/':
-            rel_path += '/'
-        if rel_path.startswith('./'):
-            rel_path = rel_path[2:]
-        if re.search(self.regex, rel_path):
-            matched = True
-        return matched
+    def match(self, abs_path: Path, is_dir: Optional[bool] = None):
+        if is_dir is None: is_dir = abs_path.is_dir()
+        try:
+            rel_path_parts = abs_path.resolve().relative_to(self.base_path).parts
+        except:
+            return False
+        rel_path = os.sep.join(rel_path_parts)
+        if self.negation and is_dir: rel_path += '/'
+        search_result = re.search(self.regex, rel_path)
+        return bool(search_result)
 
 
 # Frustratingly, python's fnmatch doesn't provide the FNM_PATHNAME
@@ -204,6 +214,7 @@ def fnmatch_pathname_to_regex(
             res.append(re.escape(c))
     if anchored:
         res.insert(0, '^')
+    res.insert(0, '(?ms)')
     if not directory_only:
         res.append('$')
     elif directory_only and negation:
